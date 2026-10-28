@@ -103,42 +103,132 @@ const eth=v=>{const n=Number(E.formatEther(v));return n>=1000?n.toFixed(0):Strin
 function toast(m,k){let t=$('#toast');if(!t){t=document.createElement('div');t.id='toast';t.setAttribute('role','status');document.body.append(t)}
  t.textContent=m;t.className='show '+(k||'');clearTimeout(toast.h);if(k!=='busy')toast.h=setTimeout(()=>t.className='',k==='err'?10000:5000)}
 const HEX='0x'+CFG.chainId.toString(16);
-const App={me:null,signer:null,_r:null,chainOk:false,
- ready(){return E.isAddress(CFG.address)},
- reader(){if(!this.ready())return null;if(!this._r){const p=CFG.rpc?new E.JsonRpcProvider(CFG.rpc):window.ethereum?new E.BrowserProvider(window.ethereum):null;if(!p)return null;this._r=new E.Contract(CFG.address,CFG.abi,p)}return this._r},
- async ensureChain(){
-  const w=window.ethereum,is=async()=>parseInt(await w.request({method:'eth_chainId'}),16)===CFG.chainId;
-  if(await is())return true;
-  try{await w.request({method:'wallet_switchEthereumChain',params:[{chainId:HEX}]})}
-  catch(e){
-   if(e.code===4001){toast('Network switch was rejected. Please switch to '+CFG.chainName+' (chain ID '+CFG.chainId+').','err');return false}
-   try{await w.request({method:'wallet_addEthereumChain',params:[{chainId:HEX,chainName:CFG.chainName,nativeCurrency:{name:CFG.symbol,symbol:CFG.symbol,decimals:18},rpcUrls:[CFG.rpc],blockExplorerUrls:[CFG.explorer]}]})}
-   catch(e2){console.error(e2);toast('Could not add '+CFG.chainName+' ('+(e2.message||e2.code)+'). Add it manually in your wallet: RPC '+CFG.rpc+', chain ID '+CFG.chainId+', symbol '+CFG.symbol+'.','err');return false}
+const App = {
+  me: null, signer: null, _r: null, chainOk: false,
+
+  ready() { return E.isAddress(CFG.address) },
+
+  reader() {
+    if (!this.ready()) return null;
+    if (!this._r) {
+      const p = CFG.rpc
+        ? new E.JsonRpcProvider(CFG.rpc)
+        : window.ethereum ? new E.BrowserProvider(window.ethereum) : null;
+      if (!p) return null;
+      this._r = new E.Contract(CFG.address, CFG.abi, p);
+    }
+    return this._r;
+  },
+
+  // quiet=true → never shows popups or toasts, used for page-load auto-connect
+  async ensureChain(quiet = false) {
+    const w = window.ethereum;
+    const onCorrectChain = async () =>
+      parseInt(await w.request({ method: 'eth_chainId' }), 16) === CFG.chainId;
+
+    if (await onCorrectChain()) return true;
+
+    try {
+      await w.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: HEX }] });
+    } catch (e) {
+      if (e.code === 4001) {
+        // User explicitly rejected — only tell them on manual connect
+        if (!quiet) toast('Network switch rejected. Switch to ' + CFG.chainName + ' (chain ID ' + CFG.chainId + ').', 'err');
+        return false;
+      }
+      // Chain not in wallet yet — try adding it
+      try {
+        await w.request({
+          method: 'wallet_addEthereumChain',
+          params: [{ chainId: HEX, chainName: CFG.chainName,
+            nativeCurrency: { name: CFG.symbol, symbol: CFG.symbol, decimals: 18 },
+            rpcUrls: [CFG.rpc], blockExplorerUrls: [CFG.explorer] }]
+        });
+      } catch (e2) {
+        if (!quiet) toast(
+          'Could not add ' + CFG.chainName + '. Add it manually: RPC ' + CFG.rpc +
+          ', chain ID ' + CFG.chainId + ', symbol ' + CFG.symbol + '.', 'err'
+        );
+        return false;
+      }
+    }
+    return onCorrectChain();
+  },
+
+  async connect(quiet = false) {
+    const w = window.ethereum;
+    if (!w) {
+      if (!quiet) toast(
+        location.protocol === 'file:'
+          ? 'No wallet detected. Host the folder (e.g. "npx serve") or enable "Allow access to file URLs" for your wallet extension.'
+          : 'No wallet detected. Install MetaMask, or open this site inside your wallet\'s built-in browser.',
+        'err'
+      );
+      return null;
+    }
+    try {
+      // eth_accounts = silent (no popup), eth_requestAccounts = manual (popup)
+      const accounts = await w.request({
+        method: quiet ? 'eth_accounts' : 'eth_requestAccounts'
+      });
+      if (!accounts.length) return null;
+
+      // Always attempt chain switch — silently on auto-connect
+      await this.ensureChain(quiet);
+
+      this.signer = await new E.BrowserProvider(w).getSigner();
+      this.me     = await this.signer.getAddress();
+      await this.paint();
+      return this.me;
+    } catch (e) {
+      console.error(e);
+      if (!quiet) toast(
+        e.code === 4001     ? 'Connection request was rejected in your wallet.'
+        : e.code === -32002 ? 'A wallet request is already pending. Open your wallet and approve it.'
+        : (e.shortMessage || e.message || 'Could not connect.'),
+        'err'
+      );
+      return null;
+    }
+  },
+
+  async paint() {
+    let ok = false;
+    if (this.me && window.ethereum) {
+      try { ok = parseInt(await window.ethereum.request({ method: 'eth_chainId' }), 16) === CFG.chainId; } catch {}
+    }
+    this.chainOk = ok;
+    const b = $('#connect');
+    if (b) { b.textContent = !this.me ? 'Connect wallet' : ok ? short(this.me) : 'Wrong network: switch'; b.title = this.me || ''; }
+    document.dispatchEvent(new Event('wallet'));
+  },
+
+  async tx(fn, done) {
+    try {
+      if (!this.ready()) { toast('Link your contract address first.', 'err'); return; }
+      if (!this.signer && !await this.connect()) return;
+      if (!await this.ensureChain()) return;          // manual context — toasts on failure
+      this.signer = await new E.BrowserProvider(window.ethereum).getSigner();
+      const c = new E.Contract(CFG.address, CFG.abi, this.signer);
+      toast('Confirm in your wallet…', 'busy');
+      const t = await fn(c);
+      toast('Waiting for confirmation…', 'busy');
+      await t.wait();
+      toast('Confirmed.', 'ok');
+      if (done) done();
+      return true;
+    } catch (e) {
+      console.error(e);
+      toast(
+        e.code === 4001 || e.code === 'ACTION_REJECTED'
+          ? 'Transaction rejected in your wallet.'
+          : (e.shortMessage || e.reason || e.message),
+        'err'
+      );
+    }
   }
-  return await is()},
- async connect(quiet){
-  const w=window.ethereum;
-  if(!w){if(!quiet)toast(location.protocol==='file:'?'No wallet detected. Wallet extensions cannot see pages opened as local files. Host the folder (for example on Vercel or with “npx serve”) or enable “Allow access to file URLs” for your wallet extension. On a phone, open this site inside your wallet’s built-in browser.':'No wallet detected. Install MetaMask, or open this site inside your wallet’s built-in browser.','err');return null}
-  try{
-   const a=await w.request({method:quiet?'eth_accounts':'eth_requestAccounts'});
-   if(!a.length)return null;
-   if(!quiet)await this.ensureChain();
-   this.signer=await new E.BrowserProvider(w).getSigner();this.me=await this.signer.getAddress();await this.paint();return this.me
-  }catch(e){console.error(e);if(!quiet)toast(e.code===4001?'Connection request was rejected in your wallet.':e.code===-32002?'A wallet request is already pending. Open your wallet and approve it.':(e.shortMessage||e.message||'Could not connect.'),'err');return null}},
- async paint(){
-  let ok=false;if(this.me&&window.ethereum){try{ok=parseInt(await window.ethereum.request({method:'eth_chainId'}),16)===CFG.chainId}catch{}}
-  this.chainOk=ok;const b=$('#connect');
-  if(b){b.textContent=!this.me?'Connect wallet':ok?short(this.me):'Wrong network: switch';b.title=this.me||''}
-  document.dispatchEvent(new Event('wallet'))},
- async tx(fn,done){try{
-  if(!this.ready()){toast('Link your contract address first (box at the top of the page).','err');return}
-  if(!this.signer&&!await this.connect())return;
-  if(!await this.ensureChain())return;
-  this.signer=await new E.BrowserProvider(window.ethereum).getSigner();
-  const c=new E.Contract(CFG.address,CFG.abi,this.signer);toast('Confirm in your wallet…','busy');
-  const t=await fn(c);toast('Waiting for confirmation…','busy');await t.wait();toast('Confirmed.','ok');if(done)done();return true
- }catch(e){console.error(e);toast(e.code===4001||e.code==='ACTION_REJECTED'?'Transaction rejected in your wallet.':(e.shortMessage||e.reason||e.message),'err')}}};
-const onWallet=fn=>document.addEventListener('wallet',fn);
+};
+ const onWallet=fn=>document.addEventListener('wallet',fn);
 document.addEventListener('DOMContentLoaded',async()=>{
  $('#connect').onclick=async()=>{if(App.me&&!App.chainOk){await App.ensureChain();return App.paint()}App.connect()};
  if(!App.ready()){$('main').insertAdjacentHTML('afterbegin','<div class="wrap"><form class="notice" id="setup"><b>Link your contract.</b> Deploy it, then paste the address here (saved in this browser).<div class="row"><input id="caddr" placeholder="0x…" aria-label="Contract address" style="flex:1;min-width:220px"><button class="btn sm">Save</button></div></form></div>');
